@@ -1,67 +1,74 @@
 #include <fcntl.h>
 #include <jack/jack.h>
+#include <math.h>
 #include <sndfile.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
+#define CROSSFADE_DURATION 2.0  // Crossfade duration in seconds
 
 // Global variables
 jack_client_t *client;
 jack_port_t *output_port_left, *output_port_right;
-SNDFILE *sndfile;
+SNDFILE *sndfile, *sndfile_new = NULL;
 SF_INFO sfinfo;
 struct termios original_term, nonblocking_term;
-float crossfade_volume = 1.0, crossfade_step = 0.0;
-int crossfade_active = 0;
+float *crossfade_buffer = NULL;
+int crossfade_samples = 0;
+int crossfade_sample_counter = 0;
 
 // The process callback
 int process(jack_nframes_t nframes, void *arg) {
-  float buffer[nframes * 2], buffer_new[nframes * 2];
+  float buffer[nframes * 2];
   float *out_left = (float *)jack_port_get_buffer(output_port_left, nframes);
   float *out_right = (float *)jack_port_get_buffer(output_port_right, nframes);
 
   // Read audio data (interleaved stereo)
   sf_readf_float(sndfile, buffer, nframes);
-  if (crossfade_active && sndfile_new) {
-    sf_readf_float(sndfile_new, buffer_new, nframes);
-  }
 
-  // Deinterleave and apply crossfade
-  for (unsigned int i = 0; i < nframes; i++) {
-    float left = buffer[2 * i];
-    float right = buffer[2 * i + 1];
-    if (crossfade_active && sndfile_new) {
-      left =
-          left * crossfade_volume + buffer_new[2 * i] * (1 - crossfade_volume);
-      right = right * crossfade_volume +
-              buffer_new[2 * i + 1] * (1 - crossfade_volume);
-      crossfade_volume -= crossfade_step;
-      if (crossfade_volume <= 0) {
-        crossfade_active = 0;
-        sf_close(sndfile);
-        sndfile = sndfile_new;
-        sndfile_new = NULL;
-        crossfade_volume = 1.0;
+  // Process crossfade if active
+  if (crossfade_sample_counter > 0) {
+    for (unsigned int i = 0; i < nframes; i++) {
+      float crossfade_ratio =
+          (float)crossfade_sample_counter / crossfade_samples;
+      out_left[i] =
+          (1 - crossfade_ratio) * buffer[2 * i] +
+          crossfade_ratio * crossfade_buffer[crossfade_sample_counter * 2];
+      out_right[i] =
+          (1 - crossfade_ratio) * buffer[2 * i + 1] +
+          crossfade_ratio * crossfade_buffer[crossfade_sample_counter * 2 + 1];
+      crossfade_sample_counter++;
+      if (crossfade_sample_counter >= crossfade_samples) {
+        crossfade_sample_counter = 0;
+        break;
       }
     }
-    out_left[i] = left;
-    out_right[i] = right;
+  } else {
+    // Normal playback
+    for (unsigned int i = 0; i < nframes; i++) {
+      out_left[i] = buffer[2 * i];
+      out_right[i] = buffer[2 * i + 1];
+    }
   }
 
   return 0;
 }
 
 void initiate_crossfade(long new_position) {
-  if (sndfile_new) sf_close(sndfile_new);
-  sndfile_new = sf_open("your_audio_file.wav", SFM_READ, &sfinfo);
-  if (sndfile_new) {
-    sf_seek(sndfile_new, new_position, SEEK_SET);
-    crossfade_active = 1;
-    crossfade_step = 1.0 / (CROSSFADE_DURATION * sfinfo.samplerate /
-                            (float)jack_get_buffer_size(client));
-  }
+  if (crossfade_buffer) free(crossfade_buffer);
+  crossfade_samples = sfinfo.samplerate * CROSSFADE_DURATION;
+  crossfade_sample_counter = 0;
+
+  // Preload crossfade buffer
+  crossfade_buffer = (float *)malloc(crossfade_samples * 2 * sizeof(float));
+  sf_seek(sndfile, new_position - crossfade_samples / 2, SEEK_SET);
+  sf_readf_float(sndfile, crossfade_buffer, crossfade_samples);
+  sf_seek(sndfile, -crossfade_samples / 2,
+          SEEK_CUR);  // Rewind to proper playback position
+
+  crossfade_sample_counter = 1;  // Start crossfade
 }
 
 void set_nonblocking_io() {
@@ -144,7 +151,8 @@ int main(int argc, char *argv[]) {
       read(STDIN_FILENO, &ch, 1);
       if (ch >= 'a' && ch <= 'z') {
         float position = (float)(ch - 'a') / 25.0f;  // Normalize to 0-1
-        sf_seek(sndfile, (sf_count_t)(position * sfinfo.frames), SEEK_SET);
+        long new_position = (long)(position * sfinfo.frames);
+        initiate_crossfade(new_position);
       }
     }
 
@@ -153,6 +161,8 @@ int main(int argc, char *argv[]) {
       break;
     }
   }
+
+  if (crossfade_buffer) free(crossfade_buffer);
 
   // Restore original IO settings
   restore_io();
