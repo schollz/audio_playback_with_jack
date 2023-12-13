@@ -13,23 +13,55 @@ jack_port_t *output_port_left, *output_port_right;
 SNDFILE *sndfile;
 SF_INFO sfinfo;
 struct termios original_term, nonblocking_term;
+float crossfade_volume = 1.0, crossfade_step = 0.0;
+int crossfade_active = 0;
 
 // The process callback
 int process(jack_nframes_t nframes, void *arg) {
-  float buffer[nframes * 2];  // Buffer for stereo (2 channels)
+  float buffer[nframes * 2], buffer_new[nframes * 2];
   float *out_left = (float *)jack_port_get_buffer(output_port_left, nframes);
   float *out_right = (float *)jack_port_get_buffer(output_port_right, nframes);
 
   // Read audio data (interleaved stereo)
   sf_readf_float(sndfile, buffer, nframes);
+  if (crossfade_active && sndfile_new) {
+    sf_readf_float(sndfile_new, buffer_new, nframes);
+  }
 
-  // Deinterleave the audio data
+  // Deinterleave and apply crossfade
   for (unsigned int i = 0; i < nframes; i++) {
-    out_left[i] = buffer[2 * i];
-    out_right[i] = buffer[2 * i + 1];
+    float left = buffer[2 * i];
+    float right = buffer[2 * i + 1];
+    if (crossfade_active && sndfile_new) {
+      left =
+          left * crossfade_volume + buffer_new[2 * i] * (1 - crossfade_volume);
+      right = right * crossfade_volume +
+              buffer_new[2 * i + 1] * (1 - crossfade_volume);
+      crossfade_volume -= crossfade_step;
+      if (crossfade_volume <= 0) {
+        crossfade_active = 0;
+        sf_close(sndfile);
+        sndfile = sndfile_new;
+        sndfile_new = NULL;
+        crossfade_volume = 1.0;
+      }
+    }
+    out_left[i] = left;
+    out_right[i] = right;
   }
 
   return 0;
+}
+
+void initiate_crossfade(long new_position) {
+  if (sndfile_new) sf_close(sndfile_new);
+  sndfile_new = sf_open("your_audio_file.wav", SFM_READ, &sfinfo);
+  if (sndfile_new) {
+    sf_seek(sndfile_new, new_position, SEEK_SET);
+    crossfade_active = 1;
+    crossfade_step = 1.0 / (CROSSFADE_DURATION * sfinfo.samplerate /
+                            (float)jack_get_buffer_size(client));
+  }
 }
 
 void set_nonblocking_io() {
